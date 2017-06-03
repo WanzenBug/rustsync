@@ -1,0 +1,19 @@
+[package]
+name = "rustsync"
+version = "0.1.0"
+authors = ["WanzenBug <moritz9422@gmail.com>"]
+
+[lib]
+name = "rustsync"
+path = "src/lib.rs"
+
+[[bin]]
+name = "rustsync"
+path = "src/main.rs"
+doc = false
+
+[dependencies]
+walkdir = "1.0.7"
+pbr = "1.0.0"
+clap = "2.24.1"
+derive-error = "0.0.3"
