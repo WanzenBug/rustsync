@@ -83,6 +83,21 @@ fn copy<R: io::Read, W: io::Write, F: FileProgress>(mut reader: R, mut writer: W
     }
 }
 
+pub struct  SuppressUpdate {}
+
+impl SyncProgress for SuppressUpdate {
+    type FileProgress = SuppressUpdate;
+
+    fn next_sync<'a>(&mut self, _: &SyncableInfo<'a>) -> Self::FileProgress {
+        SuppressUpdate {}
+    }
+}
+
+impl FileProgress for SuppressUpdate {
+    fn update(&mut self, _: u64) {
+    }
+}
+
 pub trait SyncProgress {
     type FileProgress: Send + FileProgress;
 

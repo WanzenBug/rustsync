@@ -2,6 +2,8 @@
 name = "rustsync"
 version = "0.1.0"
 authors = ["WanzenBug <moritz9422@gmail.com>"]
+description = "File copying tool akin to rsync"
+license = "MIT"
 
 [lib]
 name = "rustsync"
