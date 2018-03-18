@@ -1,103 +1,123 @@
-use ::{Result, Source, SourceSyncable, SyncableInfo, walkdir, util};
-use std::{path, fs, io};
-
-pub struct LocalSourceSyncable {
-    relative_path: String,
-    full_path: path::PathBuf,
-}
-
-impl SourceSyncable for LocalSourceSyncable {
-    type Reader = io::BufReader<fs::File>;
-
-    fn info(&self) -> Result<SyncableInfo> {
-        let meta = fs::metadata(&self.full_path)?;
-        let size = meta.len();
-        let full_path: &path::Path = self.full_path.as_ref();
-        let rel_path: &path::Path = self.relative_path.as_ref();
-        if full_path.is_dir() {
-            Ok(SyncableInfo::Directory(rel_path.components()))
-        } else {
-            Ok(SyncableInfo::File { components: rel_path.components(), size: size })
-        }
-    }
-
-    fn reader(&mut self) -> Result<Self::Reader> {
-        let f = fs::File::open(&self.full_path)?;
-        Ok(io::BufReader::new(f))
-    }
-}
+use {BasicFileInfo, Error, FileType, Result};
+use std::sync::mpsc;
+use std::thread;
+use std::path::{Path, PathBuf};
 
 pub struct LocalSource {
-    source_path: path::PathBuf,
-    strip_root_dir: bool,
+    path_queue: mpsc::Receiver<Result<BasicFileInfo>>,
+    walker: OffThreadWalker,
+}
+
+enum OffThreadWalker {
+    Started(thread::JoinHandle<()>),
+    Pending(PathBuf, mpsc::SyncSender<Result<BasicFileInfo>>),
+    Done,
+}
+
+impl OffThreadWalker {
+    fn done(&mut self) -> Result<()> {
+        let this = ::std::mem::replace(self, OffThreadWalker::Done);
+
+        let res = match this {
+            OffThreadWalker::Started(handle) => handle
+                .join()
+                .map_err(|_| Error::new("Local walker encountered unexpected error")),
+
+            OffThreadWalker::Pending(_, _) => {
+                Err(Error::new("Local walker disconnected before executing"))
+            }
+
+            OffThreadWalker::Done => Ok(()),
+        };
+
+        res
+    }
+
+    fn work(&mut self, cx: &mut ::futures::task::Context) {
+        let this = ::std::mem::replace(self, OffThreadWalker::Done);
+
+        *self = match this {
+            OffThreadWalker::Pending(root, sender) => {
+                let waker = cx.waker();
+                let handle = thread::spawn(move || OffThreadWalker::walker(root, sender, waker));
+                OffThreadWalker::Started(handle)
+            }
+            x => x,
+        };
+    }
+
+    fn walker(
+        source_location: PathBuf,
+        sender: mpsc::SyncSender<Result<BasicFileInfo>>,
+        waker: ::futures::task::Waker,
+    ) {
+        let walk = ::walkdir::WalkDir::new(source_location);
+
+        for item in walk {
+            let item = item.map_err(Into::into)
+                .and_then(OffThreadWalker::extract_basic_infos);
+            sender
+                .send(item)
+                .expect("Read end of local walker queue closed unexpectedly");
+            waker.wake();
+        }
+        ::std::mem::drop(sender);
+        waker.wake();
+    }
+
+    fn extract_basic_infos(entry: ::walkdir::DirEntry) -> Result<BasicFileInfo> {
+        let path = entry.path().to_owned();
+
+        let kind = if entry.metadata()?.is_file() {
+            FileType::File
+        } else {
+            // TODO: This is not correct, need more types
+            FileType::Directory
+        };
+        Ok(BasicFileInfo { path, kind })
+    }
 }
 
 impl LocalSource {
-    pub fn new<P: AsRef<path::Path>>(path: P) -> Self {
-        Self::with_strip_root_dir(path, false)
-    }
+    pub fn new<A: AsRef<Path>>(source_location: A) -> LocalSource {
+        let (sender, receiver) = mpsc::sync_channel(30);
 
-    pub fn with_strip_root_dir<P: AsRef<path::Path>>(path: P, strip_root: bool) -> Self {
+        let root = source_location.as_ref().to_owned();
+
         LocalSource {
-            source_path: path.as_ref().to_owned(),
-            strip_root_dir: strip_root,
+            path_queue: receiver,
+
+            walker: OffThreadWalker::Pending(root, sender),
         }
     }
 }
 
-pub struct LocalSourceIterator {
-    prefix: path::PathBuf,
-    iter: walkdir::Iter,
-}
-
-impl LocalSourceIterator {
-    fn new(source: &path::Path, strip_root: bool) -> Self {
-        let prefix = if strip_root {
-            source
-        } else {
-            source.parent().unwrap_or(source)
-        };
-
-        LocalSourceIterator {
-            prefix: prefix.to_owned(),
-            iter: walkdir::WalkDir::new(source).into_iter()
-        }
+impl ::SyncSource for LocalSource {
+    fn fetch_file(&self, info: BasicFileInfo) -> ::SyncFuture<Box<::futures::io::AsyncRead>> {
+        unimplemented!()
     }
 }
 
-impl Iterator for LocalSourceIterator {
-    type Item = Result<LocalSourceSyncable>;
+impl ::futures::Stream for LocalSource {
+    type Item = BasicFileInfo;
+    type Error = Error;
 
-    fn next(&mut self) -> Option<Self::Item> {
-        match self.iter.next() {
-            Some(Ok(x)) => {
-                let path: path::PathBuf = x.path().to_owned();
-                let relative = match path.strip_prefix(&self.prefix)
-                    .map_err(Into::into)
-                    .and_then(util::path_to_str) {
-                    Ok(p) => p.to_owned(),
-                    Err(e) => return Some(Err(e.into()))
-                };
+    fn poll_next(
+        &mut self,
+        cx: &mut ::futures::task::Context,
+    ) -> ::futures::Poll<Option<Self::Item>, Self::Error> {
+        self.walker.work(cx);
 
-                Some(Ok(LocalSourceSyncable {
-                    full_path: path,
-                    relative_path: relative
-                }))
+        match self.path_queue.try_recv() {
+            Ok(item) => match item {
+                Ok(path) => Ok(::futures::Async::Ready(Some(path))),
+                Err(err) => Err(err),
+            },
+            Err(mpsc::TryRecvError::Empty) => Ok(::futures::Async::Pending),
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.walker.done()?;
+                Ok(::futures::Async::Ready(None))
             }
-            Some(Err(e)) => Some(Err(e.into())),
-            None => None,
         }
     }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        self.iter.size_hint()
-    }
-}
-
-impl Source for LocalSource {
-    fn iter_file_info(&mut self) -> Result<Self::Iter> {
-        Ok(LocalSourceIterator::new(self.source_path.as_ref(), self.strip_root_dir))
-    }
-    type Iter = LocalSourceIterator;
-    type Syncable = LocalSourceSyncable;
 }

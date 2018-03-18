@@ -1,29 +1,38 @@
 extern crate rustsync;
+
 extern crate clap;
-extern crate pbr;
-use std::path::MAIN_SEPARATOR;
+
+extern crate futures;
 
 fn main() {
-    let matches = clap::App::new("rustsync")
-        .version(env!("CARGO_PKG_VERSION"))
-        .author(env!("CARGO_PKG_AUTHORS"))
-        .about(env!("CARGO_PKG_DESCRIPTION"))
-        .arg(clap::Arg::with_name("SRC")
-            .required(true)
-            .multiple(true))
-        .arg(clap::Arg::with_name("DEST")
-            .required(true))
-        .get_matches();
+    let parser = clap::App::new("rustsync")
+        .arg(clap::Arg::with_name("SRC").required(true))
+        .arg(clap::Arg::with_name("DEST").required(true));
 
+    let matches = parser.get_matches();
+    let src = matches
+        .value_of_os("SRC")
+        .expect("No src, should be caught in parser");
+    let dest = matches
+        .value_of_os("DEST")
+        .expect("No dest, should be caught in parser");
 
-    let source_paths = matches.values_of("SRC").expect("Clap should have caught missing values!");
-    let dest_path = matches.value_of("DEST").expect("Clap should have caught missing values!");
-    let mut src = rustsync::MultiSource::new();
-    for p in source_paths {
-        let strip_root = p.ends_with(MAIN_SEPARATOR);
-        src.add_source(rustsync::local::LocalSource::with_strip_root_dir(p, strip_root))
-    }
-    let drain = rustsync::local::LocalDrain::new(dest_path);
+    let sync_src = rustsync::LocalSource::new(src);
+    let sync_dest = rustsync::LocalDrain::new(dest);
 
-    rustsync::sync(src, drain, rustsync::SuppressUpdate{}).expect("Something went wrong");
+    let mut sync = rustsync::Syncer::new(sync_src, sync_dest);
+    use futures::IntoFuture;
+    let mut pool = futures::executor::ThreadPool::new();
+
+    let exit = match pool.run(sync.future()) {
+        Ok(()) => {
+            println!("Success");
+            0
+        }
+        Err(e) => {
+            eprintln!("{}", e);
+            1
+        }
+    };
+    std::process::exit(exit)
 }

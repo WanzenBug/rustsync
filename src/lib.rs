@@ -1,123 +1,87 @@
+extern crate futures;
 extern crate walkdir;
 
-#[macro_use]
-extern crate derive_error;
 
-mod util;
-pub mod local;
-pub mod error;
-pub mod source;
-pub mod drain;
+mod error;
+mod local;
 
-pub use drain::{DrainSyncable, Drain, DrainNotExist, DrainPathStatus};
-pub use source::{Source, SourceSyncable, MultiSource};
-pub use error::{Error, Result};
-use std::path::{Path, Components};
-use std::io;
+use futures::Stream;
+use std::path::PathBuf;
+pub use error::{Error, ErrorKind, Result};
+pub use local::{LocalDrain, LocalSource};
 
-pub struct SyncConfig {}
+type SyncFuture<T> = Box<futures::Future<Item = T, Error = Error>>;
 
-impl SyncConfig {}
+#[derive(Debug, Clone)]
+pub enum FileType {
+    File,
+    Directory,
+}
 
-impl Default for SyncConfig {
-    fn default() -> Self {
-        SyncConfig {}
+#[derive(Debug, Clone)]
+pub struct BasicFileInfo {
+    pub path: PathBuf,
+    pub kind: FileType,
+}
+
+pub trait SyncSource: Stream<Item = BasicFileInfo, Error = Error> {
+    fn fetch_file(&self, info: BasicFileInfo) -> SyncFuture<Box<futures::io::AsyncRead>>;
+}
+
+pub trait SyncDrain {
+    fn check_destination(&self, info: BasicFileInfo) -> SyncFuture<Option<BasicFileInfo>>;
+    fn write_file(&self, info: BasicFileInfo) -> SyncFuture<Box<futures::io::AsyncWrite>>;
+}
+
+pub struct Syncer<S, D>
+where
+    S: SyncSource,
+    D: SyncDrain, {
+    source: S,
+    drain: D,
+}
+
+pub struct SyncerFuture<'a> {
+    future: Box<'a + futures::Future<Item = (), Error = Error>>,
+}
+
+impl<'a> futures::Future for SyncerFuture<'a> {
+    type Item = ();
+    type Error = Error;
+
+    fn poll(&mut self, cx: &mut futures::task::Context) -> futures::Poll<Self::Item, Self::Error> {
+        self.future.poll(cx)
     }
 }
 
-pub fn sync<S, D, P>(source: S, drain: D, update: P) -> Result<()>
-    where S: Source, D: Drain, P: SyncProgress {
-    sync_with_config(source, drain, &SyncConfig::default(), update)
-}
+impl<S, D> Syncer<S, D> where
+    S: SyncSource,
+    D: SyncDrain, {
 
-pub fn sync_with_config<S, D, P>(mut source: S, drain: D, config: &SyncConfig, mut updates: P) -> Result<()> where S: Source, D: Drain, P: SyncProgress {
-    let iter = source.iter_file_info()?;
-    for f in iter {
-        let mut file_handle: <S as Source>::Syncable = f?;
-        let (dest, is_file, updates) = {
-            let info = file_handle.info()?;
-            let file_updates = updates.next_sync(&info);
-
-            let dest = drain.get_file_info(info.get_path())?;
-            if let SyncableInfo::File { .. } = info {
-                (dest, true, file_updates)
-            } else {
-                (dest, false, file_updates)
-            }
-        };
-
-        match (dest, is_file) {
-            (DrainPathStatus::Exists(dest_info), true) => {
-                copy(file_handle.reader()?, dest_info.into_file()?, updates)?;
-            }
-            (DrainPathStatus::Exists(dest_info), false) => {
-                dest_info.into_dir()?;
-            }
-            (DrainPathStatus::NoPath(no_path), true) => {
-                copy(file_handle.reader()?, no_path.file()?, updates)?;
-            }
-            (DrainPathStatus::NoPath(no_path), false) => {
-                no_path.dir()?;
-            }
-        };
+    pub fn new(source: S, drain: D) -> Self {
+        Syncer { source, drain }
     }
 
-    Ok(())
-}
+    pub fn future<'a>(&'a mut self) -> SyncerFuture<'a> {
+        use futures::{FutureExt, StreamExt};
 
-const DEFAULT_BUFFER_SIZE: usize = 4096;
+        let source = &mut self.source;
 
-fn copy<R: io::Read, W: io::Write, F: FileProgress>(mut reader: R, mut writer: W, mut progress: F) -> io::Result<u64> {
-    let mut buf: [u8; DEFAULT_BUFFER_SIZE] = [0; DEFAULT_BUFFER_SIZE];
-    let mut written = 0;
-    loop {
-        let len = match reader.read(&mut buf) {
-            Ok(0) => return Ok(written),
-            Ok(len) => len,
-            Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
-            Err(e) => return Err(e),
-        };
-        writer.write_all(&buf[..len])?;
-        written += len as u64;
-        progress.update(written)
-    }
-}
+        let drain = &mut self.drain;
 
-pub struct  SuppressUpdate {}
+        let for_each = source
+            .and_then(move |src_info| {
+                let inner = drain.check_destination(src_info.clone());
+                inner.map(|dest_info| (src_info, dest_info))
+            })
+            .for_each(|res| {
+                println!("{:?}", res);
+                Ok(())
+            })
+            .map(|s| ());
 
-impl SyncProgress for SuppressUpdate {
-    type FileProgress = SuppressUpdate;
-
-    fn next_sync<'a>(&mut self, _: &SyncableInfo<'a>) -> Self::FileProgress {
-        SuppressUpdate {}
-    }
-}
-
-impl FileProgress for SuppressUpdate {
-    fn update(&mut self, _: u64) {
-    }
-}
-
-pub trait SyncProgress {
-    type FileProgress: Send + FileProgress;
-
-    fn next_sync<'a>(&mut self, item: &SyncableInfo<'a>) -> Self::FileProgress;
-}
-
-pub trait FileProgress {
-    fn update(&mut self, transferred: u64);
-}
-
-#[derive(Debug)]
-pub enum SyncableInfo<'a> {
-    File { components: Components<'a>, size: u64 },
-    Directory(Components<'a>),
-}
-
-impl<'a> SyncableInfo<'a> {
-    pub fn get_path(&self) -> &Path {
-        match *self {
-            SyncableInfo::File { components: ref x, .. } | SyncableInfo::Directory(ref x) => x.as_ref()
+        SyncerFuture {
+            future: Box::new(for_each),
         }
     }
 }
