@@ -1,29 +1,15 @@
-use std::{io, path};
-use ::{Result, SyncableInfo};
-
-pub trait DrainSyncable {
-    type Writer: io::Write;
-
-    fn info(&self) -> Result<SyncableInfo>;
-    fn into_file(self) -> Result<Self::Writer>;
-    fn into_dir(self) -> Result<()>;
-}
-
-pub enum DrainPathStatus<S, N> where S: DrainSyncable, N: DrainNotExist {
-    Exists(S),
-    NoPath(N),
-}
-
-pub trait DrainNotExist {
-    type Writer: io::Write;
-
-    fn dir(self) -> Result<()>;
-    fn file(self) -> Result<Self::Writer>;
-}
+use ::{Result, SyncFileKind, SyncFileInfo};
+use std::{io};
 
 pub trait Drain {
-    type Syncable: DrainSyncable;
-    type NoFile: DrainNotExist;
+    fn get_info(&self, item: &SyncFileInfo) -> Result<DrainStatus>;
+    fn create_file(&self, item: &SyncFileInfo) -> Result<Box<io::Write>>;
+    fn create_directory(&self, item: &SyncFileInfo) -> Result<()>;
+}
 
-    fn get_file_info(&self, path: &path::Path) -> Result<DrainPathStatus<Self::Syncable, Self::NoFile>>;
+#[derive(Debug)]
+pub enum DrainStatus {
+    Exists,
+    IsWrongKind(SyncFileKind),
+    Missing,
 }

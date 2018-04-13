@@ -1,103 +1,53 @@
-use ::{Result, Source, SourceSyncable, SyncableInfo, walkdir, util};
+use ::{Result, Source, walkdir, SyncFileInfo, SyncFileKind};
 use std::{path, fs, io};
 
-pub struct LocalSourceSyncable {
-    relative_path: String,
-    full_path: path::PathBuf,
-}
-
-impl SourceSyncable for LocalSourceSyncable {
-    type Reader = io::BufReader<fs::File>;
-
-    fn info(&self) -> Result<SyncableInfo> {
-        let meta = fs::metadata(&self.full_path)?;
-        let size = meta.len();
-        let full_path: &path::Path = self.full_path.as_ref();
-        let rel_path: &path::Path = self.relative_path.as_ref();
-        if full_path.is_dir() {
-            Ok(SyncableInfo::Directory(rel_path.components()))
-        } else {
-            Ok(SyncableInfo::File { components: rel_path.components(), size: size })
-        }
-    }
-
-    fn reader(&mut self) -> Result<Self::Reader> {
-        let f = fs::File::open(&self.full_path)?;
-        Ok(io::BufReader::new(f))
-    }
-}
-
+#[derive(Debug)]
 pub struct LocalSource {
-    source_path: path::PathBuf,
-    strip_root_dir: bool,
+    root: path::PathBuf,
 }
 
 impl LocalSource {
-    pub fn new<P: AsRef<path::Path>>(path: P) -> Self {
-        Self::with_strip_root_dir(path, false)
-    }
-
-    pub fn with_strip_root_dir<P: AsRef<path::Path>>(path: P, strip_root: bool) -> Self {
+    pub fn new<A: AsRef<path::Path>>(root: A) -> Self {
         LocalSource {
-            source_path: path.as_ref().to_owned(),
-            strip_root_dir: strip_root,
+            root: root.as_ref().to_owned()
         }
-    }
-}
-
-pub struct LocalSourceIterator {
-    prefix: path::PathBuf,
-    iter: walkdir::Iter,
-}
-
-impl LocalSourceIterator {
-    fn new(source: &path::Path, strip_root: bool) -> Self {
-        let prefix = if strip_root {
-            source
-        } else {
-            source.parent().unwrap_or(source)
-        };
-
-        LocalSourceIterator {
-            prefix: prefix.to_owned(),
-            iter: walkdir::WalkDir::new(source).into_iter()
-        }
-    }
-}
-
-impl Iterator for LocalSourceIterator {
-    type Item = Result<LocalSourceSyncable>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        match self.iter.next() {
-            Some(Ok(x)) => {
-                let path: path::PathBuf = x.path().to_owned();
-                let relative = match path.strip_prefix(&self.prefix)
-                    .map_err(Into::into)
-                    .and_then(util::path_to_str) {
-                    Ok(p) => p.to_owned(),
-                    Err(e) => return Some(Err(e.into()))
-                };
-
-                Some(Ok(LocalSourceSyncable {
-                    full_path: path,
-                    relative_path: relative
-                }))
-            }
-            Some(Err(e)) => Some(Err(e.into())),
-            None => None,
-        }
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        self.iter.size_hint()
     }
 }
 
 impl Source for LocalSource {
-    fn iter_file_info(&mut self) -> Result<Self::Iter> {
-        Ok(LocalSourceIterator::new(self.source_path.as_ref(), self.strip_root_dir))
+    fn candidates(&self) -> Box<Iterator<Item=Result<SyncFileInfo>>> {
+        let path_root = self.root.clone();
+        let iter = walkdir::WalkDir::new(&self.root).into_iter()
+            .map(move |result| {
+                let root = &path_root;
+                result.map(|walkdir_entry|
+                    walkdir_entry_to_info(walkdir_entry, root.as_ref())
+                ).map_err(Into::into)
+            });
+
+        Box::new(iter)
     }
-    type Iter = LocalSourceIterator;
-    type Syncable = LocalSourceSyncable;
+
+    fn get_reader(&self, item: &SyncFileInfo) -> Result<Box<io::Read>> {
+        let path = self.root.join(&item.rel_path);
+        let file = fs::File::open(path)?;
+        Ok(Box::new(io::BufReader::new(file)))
+    }
+}
+
+fn walkdir_entry_to_info(entry: walkdir::DirEntry, root: &path::Path) -> SyncFileInfo {
+    let rel_path = entry.path().strip_prefix(root).unwrap_or_else(|_| entry.path()).to_owned();
+    let file_type = entry.file_type();
+    let kind = if file_type.is_file() {
+        SyncFileKind::File
+    } else if file_type.is_dir() {
+        SyncFileKind::Directory
+    } else {
+        unimplemented!()
+    };
+
+    SyncFileInfo {
+        rel_path,
+        kind,
+    }
 }

@@ -9,21 +9,17 @@ fn main() {
         .author(env!("CARGO_PKG_AUTHORS"))
         .about(env!("CARGO_PKG_DESCRIPTION"))
         .arg(clap::Arg::with_name("SRC")
-            .required(true)
-            .multiple(true))
+            .required(true))
         .arg(clap::Arg::with_name("DEST")
             .required(true))
         .get_matches();
 
 
-    let source_paths = matches.values_of("SRC").expect("Clap should have caught missing values!");
+    let source_path = matches.value_of("SRC").expect("Clap should have caught missing values!");
     let dest_path = matches.value_of("DEST").expect("Clap should have caught missing values!");
-    let mut src = rustsync::MultiSource::new();
-    for p in source_paths {
-        let strip_root = p.ends_with(MAIN_SEPARATOR);
-        src.add_source(rustsync::local::LocalSource::with_strip_root_dir(p, strip_root))
-    }
+    let src = rustsync::local::LocalSource::new(source_path);
     let drain = rustsync::local::LocalDrain::new(dest_path);
 
-    rustsync::sync(src, drain, rustsync::SuppressUpdate{}).expect("Something went wrong");
+    let sync = rustsync::Syncer::new(src, drain);
+    sync.sync().expect("Something went wrong");
 }

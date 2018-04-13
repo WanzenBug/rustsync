@@ -18,4 +18,3 @@ doc = false
 walkdir = "1.0.7"
 pbr = "1.0.0"
 clap = "2.24.1"
-derive-error = "0.0.3"
